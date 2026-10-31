@@ -35,6 +35,25 @@ pub enum SoundEvent {
 /// 32 ms at 16 kHz.
 const SENTRY_FRAME: u32 = 512;
 
+/// How fast the ambient floor may climb: 3 dB a second, as a per-frame factor.
+///
+/// **Fast down, slow up, rather than a mean.** The floor used to be an EMA (τ ≈ 6 s) over every
+/// frame outside an event, which is right for a vacuum and wrong for a person: speech under the
+/// 6× on-threshold is never an event, so it was averaged in, and so was the first frame of every
+/// event that did start (the floor updated before the threshold was checked). Measured on clips
+/// of one person talking, a −65 dBFS room ended up with a −37 dBFS floor, under which a quiet voice
+/// and a clap's margin both disappeared. Speech has gaps between words; a floor that drops to the
+/// quietest frame at once and climbs at a fixed rate sits in those gaps, and a loud first frame
+/// lifts it by one step, not by half a percent of a clap.
+///
+/// Continuous noise still raises it, at this rate, and the 3 s absorption below still catches
+/// anything louder than that rate can keep up with.
+const FLOOR_UP_PER_FRAME: f32 = 1.011_114; // 10^(3 / 20 / 31.25)
+
+/// The lowest the floor goes: digital silence must not drag it to zero, where every ratio over
+/// it is infinite. The absolute minimums on the thresholds already cover what this would let in.
+const FLOOR_MIN: f32 = 1e-6;
+
 /// How long a sound keeps the classifier armed after it, in [`SENTRY_FRAME`]s.
 ///
 /// **A whole window, derived rather than written down.** A sound heard now is still inside
@@ -48,9 +67,9 @@ const SENTRY_FRAME: u32 = 512;
 /// second" suggests.
 const AUDIBLE_HOLD_FRAMES: u32 = (crate::WINDOW_SAMPLES as u32).div_ceil(SENTRY_FRAME);
 
-/// RMS envelope watcher over ~32 ms frames with a slowly-adapting ambient floor. Petting
-/// sounds are loud on this mic (it's practically a contact mic for head scratches), so
-/// events are suppressed while the classifier reports petting (+1 s hangover).
+/// RMS envelope watcher over ~32 ms frames with an ambient floor that falls fast and rises
+/// slowly. Petting sounds are loud on this mic (it's practically a contact mic for head
+/// scratches), so events are suppressed while the classifier reports petting (+1 s hangover).
 struct SoundSentry {
     floor: f32,
     frame_acc: f32,
@@ -148,9 +167,14 @@ impl SoundSentry {
             self.audible_frames = self.audible_frames.saturating_sub(1);
         }
         if !self.in_event {
-            // The ambient floor adapts only from non-event frames (τ ≈ 6 s), so sustained
-            // noise (gait servos, music) raises the bar instead of spamming events.
-            self.floor = 0.995 * self.floor + 0.005 * rms;
+            // The ambient floor adapts only from non-event frames: down to a quieter frame at
+            // once, up by at most FLOOR_UP_PER_FRAME, so sustained noise (gait servos, music)
+            // raises the bar while talking does not. See FLOOR_UP_PER_FRAME.
+            self.floor = if rms < self.floor {
+                rms.max(FLOOR_MIN)
+            } else {
+                self.floor * FLOOR_UP_PER_FRAME
+            };
             if rms > on_thresh && self.cooldown_frames == 0 && self.petting_hold_frames == 0 {
                 self.in_event = true;
                 self.event_frames = 1;
@@ -515,5 +539,49 @@ mod tests {
             sentry.audible(),
             "a sound too small to report is not too small to classify"
         );
+    }
+
+    /// **The reason the floor falls fast and rises slowly.** Someone talking at ~10 dB over the
+    /// room, under the 6× that makes an event, with the gaps between words that speech has. A
+    /// mean learns the talking; this floor sits in the gaps.
+    #[test]
+    fn talking_does_not_raise_the_floor() {
+        let mut sentry = SoundSentry::new();
+        frames(&mut sentry, 0.001, 200);
+        for _ in 0..10 {
+            for word in 0..6 {
+                frames(&mut sentry, 0.003, 9);
+                frames(&mut sentry, if word == 5 { 0.001 } else { 0.0012 }, 1);
+            }
+        }
+        assert!(
+            sentry.floor < 0.0013,
+            "floor {} after a minute of talking",
+            sentry.floor
+        );
+    }
+
+    /// A clap's first frame is averaged in only as one step of the climb, not as a share of
+    /// the clap: the floor after it is where it was before, give or take that step.
+    #[test]
+    fn a_clap_does_not_lift_the_floor() {
+        let mut sentry = SoundSentry::new();
+        frames(&mut sentry, 0.001, 200);
+        frames(&mut sentry, 0.5, 4);
+        frames(&mut sentry, 0.001, 40);
+        assert!(
+            sentry.floor < 0.00105,
+            "floor {} after a clap",
+            sentry.floor
+        );
+    }
+
+    /// Noise that does not stop is the room: the floor still climbs to meet it.
+    #[test]
+    fn a_running_vacuum_becomes_the_floor() {
+        let mut sentry = SoundSentry::new();
+        frames(&mut sentry, 0.001, 200);
+        frames(&mut sentry, 0.02, 31 * 15);
+        assert!(sentry.floor > 0.01, "floor {} under a vacuum", sentry.floor);
     }
 }
